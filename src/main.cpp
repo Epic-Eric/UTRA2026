@@ -151,6 +151,14 @@ public:
   }
 };
 
+// ===================== Global Devices =====================
+MotorDriver motors;
+LineFollower line;
+Ultrasonic us;
+TCS3200 color;
+Servo servoClaw;
+Servo servoShoot;
+
 enum ColorClass { COL_UNKNOWN, COL_BLACK, COL_BLUE, COL_RED, COL_GREEN, COL_PURPLE, COL_WHITE };
 
 ColorClass classifyColor(const RGBi &rgb) {
@@ -201,33 +209,33 @@ ColorClass classifyColorNormalized(const RGBi &n) {
   return COL_WHITE;
 }
 
-// ===================== Global Devices =====================
-MotorDriver motors;
-LineFollower line;
-Ultrasonic us;
-TCS3200 color;
-Servo servoClaw;
-Servo servoShoot;
 
 // ===================== State Machine =====================
 enum State {
   ST_STARTUP,
+  ST_IDLE,
   ST_SEARCH_BOX,
   ST_PICK_BOX,
-  ST_TO_BLUE_ZONE,
   ST_DROP_BOX,
-  ST_CHOOSE_GREEN,
-  ST_FOLLOW_GREEN,
-  ST_TARGET_SEARCH,
-  ST_AT_CENTER,
-  ST_SHOOT,
-  ST_EXIT_PLATFORM,
-  ST_RETURN,
-  ST_DONE
+  // Stage 1 revised flow
+  ST_FOLLOW_BLACK_TO_SPLIT,
+  ST_SELECT_GREEN,
+  ST_FOLLOW_GREEN_TO_BLUE_DROP,
+  ST_FOLLOW_GREEN_TO_BLACK,
+  ST_FOLLOW_BLACK_TO_NONBLACK,
+  ST_STRAIGHT_TO_BLACK_AGAIN,
+  ST_STAGE1_END,
+  // Stage 2
+  ST_STAGE2_RUN
 };
 
 State state = ST_STARTUP;
 unsigned long stateTs = 0;
+
+enum StageMode { STAGE_NONE, STAGE_1, STAGE_2 };
+StageMode stageMode = STAGE_NONE;
+// Streaming flags
+unsigned long irStreamTs = 0;
 
 void setState(State s) {
   state = s;
@@ -255,6 +263,9 @@ void printHelp() {
   Serial.println(" set tg x : set TURN_GAIN to x");
   Serial.println(" set ib x : set IR_BLACK_LEVEL to x");
   Serial.println(" set iw x : set IR_WHITE_LEVEL to x");
+  Serial.println(" run1     : start Stage 1 sequence");
+  Serial.println(" run2     : start Stage 2 sequence");
+  Serial.println(" stop     : stop and idle");
 }
 
 void handleSerial() {
@@ -288,6 +299,16 @@ void handleSerial() {
     clawClose();
   } else if (cmd == "shoot") {
     shooterFire();
+  } else if (cmd == "run1") {
+    stageMode = STAGE_1;
+    setState(ST_SEARCH_BOX);
+  } else if (cmd == "run2") {
+    stageMode = STAGE_2;
+    setState(ST_STAGE2_RUN);
+  } else if (cmd == "stop") {
+    stageMode = STAGE_NONE;
+    motors.stop();
+    setState(ST_IDLE);
   } else if (cmd.startsWith("set ")) {
     // set <var> <value>
     int sp1 = cmd.indexOf(' ');
@@ -329,10 +350,7 @@ bool obstacleAhead() {
 }
 
 // Seek center black by sweeping until color class becomes COL_BLACK
-bool atBlackCenter() {
-  RGBi v = color.readRGB();
-  return classifyColor(v) == COL_BLACK;
-}
+// removed legacy center-seek helper
 
 // ===================== Setup/Loop =====================
 void setup() {
@@ -349,6 +367,7 @@ void setup() {
 
   pinMode(Pins::BTN_CAL, INPUT_PULLUP);
   Serial.println("UTRA 2026 Robot: Ready. Type 'h' for help.");
+  Serial.println("Type 'run1' to start Stage 1 or 'run2' for Stage 2.");
   setState(ST_SEARCH_BOX);
 }
 
@@ -356,6 +375,11 @@ void loop() {
   handleSerial();
 
   switch (state) {
+    case ST_IDLE: {
+      motors.stop();
+    } break;
+
+    // ===== Stage 1 Behavior =====
     case ST_SEARCH_BOX: {
       // Follow line until an object is near (blue zone box)
       if (obstacleAhead()) {
@@ -370,91 +394,120 @@ void loop() {
       // Close claw to pick box
       clawClose();
       delay(500);
-      setState(ST_TO_BLUE_ZONE);
+      setState(ST_FOLLOW_BLACK_TO_SPLIT);
     } break;
 
-    case ST_TO_BLUE_ZONE: {
-      // Move until we detect BLUE strongly, then stop
+    case ST_DROP_BOX: {
+      // Explicit drop box state (triggered when BLUE is detected on green path)
+      clawOpen();
+      delay(400);
+      setState(ST_FOLLOW_GREEN_TO_BLACK);
+    } break;
+
+    case ST_FOLLOW_BLACK_TO_SPLIT: {
+      // Follow black line until color sensor sees green or red (crossroad)
+      RGBi vn = readRGBNormalized();
+      ColorClass c = classifyColorNormalized(vn);
+      if (c == COL_GREEN || c == COL_RED) {
+        motors.stop();
+        setState(ST_SELECT_GREEN);
+      } else {
+        followLineStep(Config::BASE_SPEED);
+      }
+    } break;
+
+    case ST_SELECT_GREEN: {
+      // Choose green: bias left and search for consistent GREEN readings
+      RGBi vn = readRGBNormalized();
+      ColorClass c = classifyColorNormalized(vn);
+      if (c == COL_GREEN) {
+        // Lock in: follow green until blue to drop box
+        setState(ST_FOLLOW_GREEN_TO_BLUE_DROP);
+      } else {
+        // Bias left to acquire green path
+        motors.turnLeft(Config::SLOW_SPEED);
+      }
+    } break;
+
+    case ST_FOLLOW_GREEN_TO_BLUE_DROP: {
+      // Follow green path until we see blue, then drop box
       RGBi vn = readRGBNormalized();
       ColorClass c = classifyColorNormalized(vn);
       if (c == COL_BLUE) {
         motors.stop();
         setState(ST_DROP_BOX);
+      } else if (c == COL_GREEN) {
+        // slight left bias while following green
+        motors.drive(Config::BASE_SPEED - 10, Config::BASE_SPEED + 10);
       } else {
+        // keep moving, try to reacquire green
         followLineStep(Config::SLOW_SPEED);
       }
     } break;
 
-    case ST_DROP_BOX: {
-      clawOpen();
-      delay(400);
-      setState(ST_CHOOSE_GREEN);
-    } break;
-
-    case ST_CHOOSE_GREEN: {
-      // Default path: green (target shooting)
-      setState(ST_FOLLOW_GREEN);
-    } break;
-
-    case ST_FOLLOW_GREEN: {
-      // Follow line; once we start seeing ring colors (blue/red/green), assume on platform
+    case ST_FOLLOW_GREEN_TO_BLACK: {
+      // Continue along green until encountering black
       RGBi vn = readRGBNormalized();
       ColorClass c = classifyColorNormalized(vn);
-      if (c == COL_BLUE || c == COL_RED || c == COL_GREEN || c == COL_BLACK) {
+      if (c == COL_BLACK) {
         motors.stop();
-        setState(ST_TARGET_SEARCH);
+        setState(ST_FOLLOW_BLACK_TO_NONBLACK);
       } else {
-        followLineStep(Config::BASE_SPEED);
+        // continue along green with slight left bias
+        motors.drive(Config::BASE_SPEED - 10, Config::BASE_SPEED + 10);
       }
     } break;
 
-    case ST_TARGET_SEARCH: {
-      // Sweep-spin until we detect black center
+    case ST_FOLLOW_BLACK_TO_NONBLACK: {
+      // Follow black line until a different color is seen
       RGBi vn = readRGBNormalized();
-      if (classifyColorNormalized(vn) == COL_BLACK) {
-        motors.stop();
-        setState(ST_AT_CENTER);
-      } else {
-        motors.turnRight(Config::SLOW_SPEED);
-      }
-    } break;
-
-    case ST_AT_CENTER: {
-      // Fire the ball
-      setState(ST_SHOOT);
-    } break;
-
-    case ST_SHOOT: {
-      shooterFire();
-      delay(400);
-      setState(ST_EXIT_PLATFORM);
-    } break;
-
-    case ST_EXIT_PLATFORM: {
-      // Back up a bit, then resume line following
-      motors.backward(Config::SLOW_SPEED);
-      delay(800);
-      setState(ST_RETURN);
-    } break;
-
-    case ST_RETURN: {
-      // Follow line back; stop after some time or obstacle pattern
-      if (millis() - stateTs > 120000UL) { // 2 minutes safety
-        motors.stop();
-        setState(ST_DONE);
-      } else if (obstacleAhead()) {
-        motors.stop();
-        delay(300);
-        // Try a bypass maneuver
-        motors.turnLeft(Config::SLOW_SPEED);
-        delay(400);
+      ColorClass c = classifyColorNormalized(vn);
+      if (c != COL_BLACK) {
+        // switch to going straight until black appears again
+        setState(ST_STRAIGHT_TO_BLACK_AGAIN);
       } else {
         followLineStep(Config::BASE_SPEED);
       }
     } break;
 
-    case ST_DONE: {
+    case ST_STRAIGHT_TO_BLACK_AGAIN: {
+      // Keep going straight until black is detected again, then stop (Stage 1 end)
+      RGBi vn = readRGBNormalized();
+      ColorClass c = classifyColorNormalized(vn);
+      if (c == COL_BLACK) {
+        motors.stop();
+        setState(ST_STAGE1_END);
+      } else {
+        motors.forward(Config::BASE_SPEED);
+      }
+    } break;
+
+    case ST_STAGE1_END: {
       motors.stop();
+      stageMode = STAGE_NONE;
+      setState(ST_IDLE);
+    } break;
+
+    // legacy states removed
+
+    // ===== Stage 2 Behavior =====
+    case ST_STAGE2_RUN: {
+      // Read color and follow rules:
+      // - if BLUE: turn right
+      // - if GREEN: follow with slight left bias
+      // - if RED: turn right
+      // - if BLACK: go straight
+      RGBi vn = readRGBNormalized();
+      ColorClass c = classifyColorNormalized(vn);
+      if (c == COL_BLUE || c == COL_RED) {
+        motors.turnRight(Config::SLOW_SPEED);
+      } else if (c == COL_GREEN) {
+        motors.drive(Config::BASE_SPEED - 12, Config::BASE_SPEED + 12);
+      } else if (c == COL_BLACK) {
+        motors.forward(Config::BASE_SPEED);
+      } else {
+        motors.forward(Config::SLOW_SPEED);
+      }
     } break;
   }
 }
